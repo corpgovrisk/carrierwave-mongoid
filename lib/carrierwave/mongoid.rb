@@ -38,19 +38,57 @@ module CarrierWave
           super
         end
 
+        # Overrides Mongoid's default dirty behavior to instead work more like
+        # ActiveRecord's. Mongoid doesn't deem an attribute as changed unless
+        # the new value is different than the original. Given that CarrierWave
+        # caches files before save, it's necessary to know that there's a
+        # pending change even though the attribute value itself might not
+        # reflect that yet.
+        def #{column}_changed?
+          changed_attributes.has_key?("#{column}")
+        end
+
         def find_previous_model_for_#{column}
           if self.embedded?
             ancestors       = [[ self.metadata.key, self._parent ]].tap { |x| x.unshift([ x.first.last.metadata.key, x.first.last._parent ]) while x.first.last.embedded? }
             first_parent = ancestors.first.last
-            reloaded_parent = first_parent.class.find(first_parent.to_key.first)
-            ancestors.inject(reloaded_parent) { |parent,(key,ancestor)| (parent.is_a?(Array) ? parent.find(ancestor.to_key.first) : parent).send(key) }.find(to_key.first)
+            reloaded_parent = first_parent.class.unscoped.find(first_parent.to_key.first)
+            association = ancestors.inject(reloaded_parent) { |parent,(key,ancestor)| (parent.is_a?(Array) ? parent.find(ancestor.to_key.first) : parent).send(key) }
+            association.is_a?(Array) ? association.find(to_key.first) : association
           else
-            self.class.find(to_key.first)
+            self.class.unscoped.find(to_key.first)
           end
+        end
+
+        def serializable_hash(options=nil)
+          hash = {}
+          self.class.uploaders.each do |column, uploader|
+            hash[column.to_s] = _mounter(:#{column}).uploader.serializable_hash
+          end
+          super(options).merge(hash)
         end
       RUBY
     end
   end # Mongoid
 end # CarrierWave
+
+CarrierWave::Storage.autoload :GridFS, 'carrierwave/storage/grid_fs'
+
+class CarrierWave::Uploader::Base
+  add_config :grid_fs_connection
+  add_config :grid_fs_database
+  add_config :grid_fs_host
+  add_config :grid_fs_port
+  add_config :grid_fs_username
+  add_config :grid_fs_password
+  add_config :grid_fs_access_url
+
+  configure do |config|
+    config.storage_engines[:grid_fs] = "CarrierWave::Storage::GridFS"
+    config.grid_fs_database = "carrierwave"
+    config.grid_fs_host = "localhost"
+    config.grid_fs_port = 27017
+  end
+end
 
 Mongoid::Document::ClassMethods.send(:include, CarrierWave::Mongoid)

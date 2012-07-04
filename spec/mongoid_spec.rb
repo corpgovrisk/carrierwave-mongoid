@@ -21,16 +21,20 @@ end
 
 class MongoUploader < CarrierWave::Uploader::Base; end
 
-class WhiteListUploader < CarrierWave::Uploader::Base
+class IntegrityErrorUploader < CarrierWave::Uploader::Base
+  process :monkey
+  def monkey
+    raise CarrierWave::IntegrityError
+  end
   def extension_white_list
-    %w(txt)
+    %w(jpg)
   end
 end
 
 class ProcessingErrorUploader < CarrierWave::Uploader::Base
   process :monkey
   def monkey
-    raise CarrierWave::ProcessingError, "Ohh noez!"
+    raise CarrierWave::ProcessingError
   end
   def extension_white_list
     %w(jpg)
@@ -93,6 +97,31 @@ describe CarrierWave::Mongoid do
         @doc.image.current_path.should == public_path('uploads/test.jpg')
       end
 
+      it "should return valid JSON when to_json is called when image is nil" do
+        @doc[:image] = nil
+        hash = JSON.parse(@doc.to_json)
+        hash.keys.should include("image")
+        hash["image"].keys.should include("url")
+        hash["image"]["url"].should be_nil
+      end
+
+      it "should return valid JSON when to_json is called when image is present" do
+        @doc[:image] = 'test.jpeg'
+        @doc.save!
+        @doc.reload
+
+        JSON.parse(@doc.to_json)["image"].should == {"url" => "/uploads/test.jpeg"}
+      end
+
+      it "should return valid JSON when to_json is called on a collection containing uploader from a model" do
+        @doc[:image] = 'test.jpeg'
+        @doc.save!
+        @doc.reload
+
+        JSON.parse({:data => @doc.image}.to_json).should == {"data"=>{"image"=>{"url"=>"/uploads/test.jpeg"}}}
+      end
+
+
     end
 
   end
@@ -142,7 +171,7 @@ describe CarrierWave::Mongoid do
 
     context 'when validating integrity' do
       before do
-        mongo_user_klass = reset_mongo_class(WhiteListUploader)
+        mongo_user_klass = reset_mongo_class(IntegrityErrorUploader)
         @doc = mongo_user_klass.new
         @doc.image = stub_file('test.jpg')
       end
@@ -153,7 +182,7 @@ describe CarrierWave::Mongoid do
 
       it "should use I18n for integrity error messages" do
         @doc.valid?
-        @doc.errors[:image].should == ['is not an allowed file type']
+        @doc.errors[:image].should == ['is not of an allowed file type']
 
         change_locale_and_store_translations(:pt, :mongoid => {
           :errors => {
@@ -403,25 +432,7 @@ describe CarrierWave::Mongoid do
       end
     end
 
-    describe 'with embedded documents' do
-
-      before do
-        @embedded_doc_class = define_mongo_class('MongoLocation') do
-          include Mongoid::Document
-          mount_uploader :image, @uploader
-          embedded_in :mongo_user
-        end
-
-        @class.class_eval do
-          embeds_many :mongo_locations
-        end
-
-        @doc = @class.new
-        @embedded_doc = @doc.mongo_locations.build
-        @embedded_doc.image = stub_file('old.jpeg')
-        @embedded_doc.save.should be_true
-      end
-
+    shared_examples "embedded documents" do
       it "should remove old file if old file had a different path" do
         @embedded_doc.image = stub_file('new.jpeg')
         @embedded_doc.save.should be_true
@@ -457,6 +468,101 @@ describe CarrierWave::Mongoid do
         @embedded_doc.save.should be_true
         @doc.title.should == "Title"
       end
+    end
+
+    shared_examples "double embedded documents" do
+      it "should remove old file if old file had a different path" do
+        @double_embedded_doc.image = stub_file('new.jpeg')
+        @double_embedded_doc.save.should be_true
+        File.exists?(public_path('uploads/new.jpeg')).should be_true
+        File.exists?(public_path('uploads/old.jpeg')).should be_false
+      end
+
+      it "should not remove old file if old file had a different path but config is false" do
+        @double_embedded_doc.image.stub!(:remove_previously_stored_files_after_update).and_return(false)
+        @double_embedded_doc.image = stub_file('new.jpeg')
+        @double_embedded_doc.save.should be_true
+        File.exists?(public_path('uploads/new.jpeg')).should be_true
+        File.exists?(public_path('uploads/old.jpeg')).should be_true
+      end
+
+      it "should not remove file if old file had the same path" do
+        @double_embedded_doc.image = stub_file('old.jpeg')
+        @double_embedded_doc.save.should be_true
+        File.exists?(public_path('uploads/old.jpeg')).should be_true
+      end
+
+      it "should not remove file if validations fail on save" do
+        @double_embedded_doc_class.validate { |r| r.errors.add :textfile, "FAIL!" }
+        @double_embedded_doc.image = stub_file('new.jpeg')
+        @double_embedded_doc.save.should be_false
+        File.exists?(public_path('uploads/old.jpeg')).should be_true
+      end
+
+    end
+
+    describe 'with document embedded as embeds_one' do
+      before do
+        @embedded_doc_class = define_mongo_class('MongoLocation') do
+          include Mongoid::Document
+          mount_uploader :image, @uploader
+          embedded_in :mongo_user
+        end
+
+        @class.class_eval do
+          embeds_one :mongo_location
+        end
+
+        @doc = @class.new
+        @embedded_doc = @doc.build_mongo_location
+        @embedded_doc.image = stub_file('old.jpeg')
+        @embedded_doc.save.should be_true
+      end
+
+      include_examples "embedded documents"
+    end
+
+    describe 'with document embedded as embeds_one and parent document not matched the default scope' do
+      before do
+        @embedded_doc_class = define_mongo_class('MongoLocation') do
+          include Mongoid::Document
+          mount_uploader :image, @uploader
+          embedded_in :mongo_user
+        end
+
+        @class.class_eval do
+          embeds_one :mongo_location
+          default_scope where(:always_false => false)
+        end
+
+        @doc = @class.new
+        @embedded_doc = @doc.build_mongo_location
+        @embedded_doc.image = stub_file('old.jpeg')
+        @embedded_doc.save.should be_true
+      end
+
+      include_examples "embedded documents"
+    end
+
+    describe 'with embedded documents' do
+      before do
+        @embedded_doc_class = define_mongo_class('MongoLocation') do
+          include Mongoid::Document
+          mount_uploader :image, @uploader
+          embedded_in :mongo_user
+        end
+
+        @class.class_eval do
+          embeds_many :mongo_locations
+        end
+
+        @doc = @class.new
+        @embedded_doc = @doc.mongo_locations.build
+        @embedded_doc.image = stub_file('old.jpeg')
+        @embedded_doc.save.should be_true
+      end
+
+      include_examples "embedded documents"
 
       describe 'with double embedded documents' do
 
@@ -481,36 +587,56 @@ describe CarrierWave::Mongoid do
           @double_embedded_doc.save.should be_true
         end
 
-        it "should remove old file if old file had a different path" do
-          @double_embedded_doc.image = stub_file('new.jpeg')
-          @double_embedded_doc.save.should be_true
-          File.exists?(public_path('uploads/new.jpeg')).should be_true
-          File.exists?(public_path('uploads/old.jpeg')).should be_false
+        include_examples "double embedded documents"
+      end
+    end
+
+    describe 'with embedded documents and parent document not matched the default scope' do
+      before do
+        @embedded_doc_class = define_mongo_class('MongoLocation') do
+          include Mongoid::Document
+          mount_uploader :image, @uploader
+          embedded_in :mongo_user
         end
 
-        it "should not remove old file if old file had a different path but config is false" do
-          @double_embedded_doc.image.stub!(:remove_previously_stored_files_after_update).and_return(false)
-          @double_embedded_doc.image = stub_file('new.jpeg')
-          @double_embedded_doc.save.should be_true
-          File.exists?(public_path('uploads/new.jpeg')).should be_true
-          File.exists?(public_path('uploads/old.jpeg')).should be_true
+        @class.class_eval do
+          embeds_many :mongo_locations
+          default_scope where(:always_false => false)
         end
 
-        it "should not remove file if old file had the same path" do
-          @double_embedded_doc.image = stub_file('old.jpeg')
-          @double_embedded_doc.save.should be_true
-          File.exists?(public_path('uploads/old.jpeg')).should be_true
-        end
-
-        it "should not remove file if validations fail on save" do
-          @double_embedded_doc_class.validate { |r| r.errors.add :textfile, "FAIL!" }
-          @double_embedded_doc.image = stub_file('new.jpeg')
-          @double_embedded_doc.save.should be_false
-          File.exists?(public_path('uploads/old.jpeg')).should be_true
-        end
-
+        @doc = @class.new
+        @embedded_doc = @doc.mongo_locations.build
+        @embedded_doc.image = stub_file('old.jpeg')
+        @embedded_doc.save.should be_true
       end
 
+      include_examples "embedded documents"
+
+      describe 'with double embedded documents' do
+
+        before do
+          @double_embedded_doc_class = define_mongo_class('MongoItem') do
+            include Mongoid::Document
+            mount_uploader :image, @uploader
+            embedded_in :mongo_location
+          end
+
+          @embedded_doc_class.class_eval do
+            embeds_many :mongo_items
+          end
+
+          @doc = @class.new
+          @embedded_doc = @doc.mongo_locations.build
+          @embedded_doc.image = stub_file('old.jpeg')
+          @embedded_doc.save.should be_true
+
+          @double_embedded_doc = @embedded_doc.mongo_items.build
+          @double_embedded_doc.image = stub_file('old.jpeg')
+          @double_embedded_doc.save.should be_true
+        end
+
+        include_examples "double embedded documents"
+      end
     end
   end
 
